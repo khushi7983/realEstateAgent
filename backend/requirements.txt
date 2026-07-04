@@ -5,3 +5,5 @@ requests
 pyjwt
 python-multipart
 google-generativeai
+beautifulsoup4
+lxml

@@ -9,6 +9,23 @@ export const CITY_KEYWORDS: Record<string, string> = {
   gurugram: 'Delhi',
   gurgaon: 'Delhi',
   ncr: 'Delhi',
+  // ARK Group cities
+  bengaluru: 'Bengaluru',
+  bangalore: 'Bengaluru',
+  whitefield: 'Bengaluru',
+  kurnool: 'Kurnool',
+  bhimavaram: 'Bhimavaram',
+  suryapet: 'Suryapet',
+  // Hyderabad sub-localities (ARK projects)
+  bachupally: 'Hyderabad',
+  uppal: 'Hyderabad',
+  kondapur: 'Hyderabad',
+  gachibowli: 'Hyderabad',
+  'hitec city': 'Hyderabad',
+  'hitec': 'Hyderabad',
+  telangana: 'Hyderabad',
+  'kongara kalan': 'Hyderabad',
+  kharmanghat: 'Hyderabad',
 }
 
 export function detectCityFromText(text: string): string | null {
