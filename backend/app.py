@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from services.inventory import build_inventory_context, detect_city_from_text, get_apartments_for_city
+from services.language import language_instruction, normalize_language_code, resolve_response_language
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -61,7 +62,7 @@ app.add_middleware(
 class VoiceTurnRequest(BaseModel):
     transcript: str
     voice: str = "default"
-    language: str = "en-US"
+    language: str = "unknown"     # STT-detected BCP-47 code, or "unknown" for text detection
     session_id: str = "default"   # unique per browser session
     city: str | None = None       # active city from UI or detected from speech
 
@@ -85,11 +86,15 @@ def soravm_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {require_env('SORAVM_API_KEY')}"}
 
 
-def transcribe_with_soravm(audio_file: UploadFile, language: str) -> dict:
+def transcribe_with_soravm(audio_file: UploadFile, language_code: str = "unknown") -> dict:
     audio_bytes = audio_file.file.read()
     url = "https://api.sarvam.ai/speech-to-text"
     files = {"file": (audio_file.filename, audio_bytes, audio_file.content_type)}
-    data = {"language": language}
+    data = {
+        "model": "saaras:v3",
+        "mode": "transcribe",
+        "language_code": language_code or "unknown",
+    }
 
     response = requests.post(url, headers=soravm_headers(), files=files, data=data, timeout=120)
     if response.status_code != 200:
@@ -98,16 +103,46 @@ def transcribe_with_soravm(audio_file: UploadFile, language: str) -> dict:
     return response.json()
 
 
-def synthesize_with_soravm(text: str, voice: str) -> bytes:
+def resolve_speaker(voice: str) -> str:
+    if not voice or voice == "default":
+        return "shubh"
+    return voice
+
+
+def synthesize_sarvam_tts(text: str, target_language_code: str, voice: str = "default") -> tuple[str, str]:
+    """Call Sarvam Bulbul v3 TTS. Returns (audio_base64, mime_type)."""
     url = "https://api.sarvam.ai/text-to-speech"
     headers = {**soravm_headers(), "Content-Type": "application/json"}
-    payload = {"text": text, "voice": voice, "format": "wav"}
+    payload = {
+        "text": text,
+        "target_language_code": normalize_language_code(target_language_code),
+        "model": "bulbul:v3",
+        "speaker": resolve_speaker(voice),
+        "output_audio_codec": "wav",
+    }
 
     response = requests.post(url, headers=headers, json=payload, timeout=120)
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail=response.text)
 
-    return response.content
+    if response.headers.get("content-type", "").startswith("application/json"):
+        body = response.json()
+        audios = body.get("audios")
+        if not audios or not isinstance(audios, list) or not isinstance(audios[0], str):
+            raise HTTPException(status_code=502, detail=f"TTS service returned invalid JSON payload: {body}")
+        return audios[0], "audio/wav"
+
+    content_type = tts_content_type(response)
+    if not content_type.startswith("audio/"):
+        raise HTTPException(status_code=502, detail="TTS service returned a non-audio response")
+
+    audio_base64 = base64.b64encode(response.content).decode("utf-8")
+    return audio_base64, content_type
+
+
+def synthesize_with_soravm(text: str, voice: str, target_language_code: str = "en-IN") -> bytes:
+    audio_base64, _ = synthesize_sarvam_tts(text, target_language_code, voice)
+    return base64.b64decode(audio_base64)
 
 
 def tts_content_type(response: requests.Response) -> str:
@@ -235,6 +270,7 @@ def generate_deepseek_reply(
     transcript: str,
     history: list[dict],
     city: str | None = None,
+    language: str = "en-IN",
 ) -> tuple[str, str]:
     """Call DeepSeek's OpenAI-compatible chat completions endpoint.
     `history` is the full message list for this session (excluding the current
@@ -255,7 +291,8 @@ def generate_deepseek_reply(
         "preferred location, property type, number of bedrooms, and any other preferences. "
         "Use that context in every reply without asking for information already given. "
         "Answer only questions about property search, budgets, locations, amenities, "
-        "EMI, or site visits. Keep replies under 3 sentences.\n\n"
+        "EMI, or site visits. Keep replies under 3 sentences.\n"
+        f"{language_instruction(language)}\n\n"
         + (inventory_block if inventory_block else "No property inventory loaded for this city yet.")
     )
 
@@ -361,36 +398,24 @@ async def livekit_token(room: str, identity: str):
 
 
 @app.post("/soravm/stt")
-async def soravm_stt(audio_file: UploadFile = File(...), language: str = Form("en-US")):
-    return transcribe_with_soravm(audio_file=audio_file, language=language)
+async def soravm_stt(
+    audio_file: UploadFile = File(...),
+    language_code: str = Form("unknown"),
+    language: str | None = Form(None),
+):
+    # Accept both `language_code` (Sarvam) and legacy `language` from older clients.
+    resolved_code = language_code if language_code else (language or "unknown")
+    return transcribe_with_soravm(audio_file=audio_file, language_code=resolved_code)
 
 
 @app.post("/soravm/tts")
-async def soravm_tts(text: str = Form(...), voice: str = Form("default")):
-    response = requests.post(
-        "https://api.sarvam.ai/text-to-speech",
-        headers={**soravm_headers(), "Content-Type": "application/json"},
-        json={"text": text, "voice": voice, "format": "wav"},
-        timeout=120,
-    )
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=502, detail=response.text)
-
-    if response.headers.get("content-type", "").startswith("application/json"):
-        body = response.json()
-        audios = body.get("audios")
-        if not audios or not isinstance(audios, list) or not isinstance(audios[0], str):
-            raise HTTPException(status_code=502, detail=f"TTS service returned invalid JSON payload: {body}")
-        return {"audio_base64": audios[0], "audio_mime_type": "audio/wav"}
-
-    content_type = tts_content_type(response)
-    if not content_type.startswith("audio/"):
-        raise HTTPException(status_code=502, detail="TTS service returned a non-audio response")
-
-    audio_bytes = response.content
-    audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
-    return {"audio_base64": audio_base64, "audio_mime_type": content_type}
+async def soravm_tts(
+    text: str = Form(...),
+    voice: str = Form("default"),
+    target_language_code: str = Form("en-IN"),
+):
+    audio_base64, audio_mime_type = synthesize_sarvam_tts(text, target_language_code, voice)
+    return {"audio_base64": audio_base64, "audio_mime_type": audio_mime_type}
 
 
 @app.post("/voice/turn")
@@ -400,9 +425,12 @@ async def voice_turn(turn: VoiceTurnRequest):
     history = conversation_store.setdefault(session_id, [])
 
     resolved_city = turn.city or detect_city_from_text(turn.transcript)
+    resolved_language = resolve_response_language(turn.language, turn.transcript)
 
     # ── Active: DeepSeek (with conversation memory) ───────────────────────────
-    response_text, reply_source = generate_deepseek_reply(turn.transcript, history, resolved_city)
+    response_text, reply_source = generate_deepseek_reply(
+        turn.transcript, history, resolved_city, resolved_language
+    )
     # ── Rollback: swap the line above with the one below to revert to Gemini ──
     # response_text, reply_source = generate_gemini_reply(turn.transcript)
     # ─────────────────────────────────────────────────────────────────────────
@@ -415,33 +443,9 @@ async def voice_turn(turn: VoiceTurnRequest):
         excess = len(history) - MAX_HISTORY_MESSAGES
         del history[:excess]
 
-    response = requests.post(
-        "https://api.sarvam.ai/text-to-speech",
-        headers={**soravm_headers(), "Content-Type": "application/json"},
-        json={
-            "text": response_text,
-            "voice": turn.voice,
-            "format": "wav",
-        },
-        timeout=120,
+    audio_base64, audio_mime_type = synthesize_sarvam_tts(
+        response_text, resolved_language, turn.voice
     )
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=502, detail=response.text)
-
-    if response.headers.get("content-type", "").startswith("application/json"):
-        body = response.json()
-        audios = body.get("audios")
-        if not audios or not isinstance(audios, list) or not isinstance(audios[0], str):
-            raise HTTPException(status_code=502, detail=f"No audio returned from Soravm TTS: {body}")
-        audio_base64 = audios[0]
-        audio_mime_type = "audio/wav"
-    else:
-        content_type = tts_content_type(response)
-        if not content_type.startswith("audio/"):
-            raise HTTPException(status_code=502, detail="TTS service returned a non-audio response")
-        audio_base64 = base64.b64encode(response.content).decode("utf-8")
-        audio_mime_type = content_type
 
     return {
         "transcript": turn.transcript,
@@ -449,7 +453,7 @@ async def voice_turn(turn: VoiceTurnRequest):
         "reply_source": reply_source,
         "audio_base64": audio_base64,
         "audio_mime_type": audio_mime_type,
-        "language": turn.language,
+        "language": resolved_language,
         "voice": turn.voice,
     }
 

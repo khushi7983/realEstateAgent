@@ -27,6 +27,22 @@ type VoiceTurnResponse = {
   response_text?: string
   audio_base64?: string
   audio_mime_type?: string
+  language?: string
+}
+
+type SupportedLanguage = 'en-IN' | 'hi-IN' | 'te-IN'
+
+const LANGUAGE_LABELS: Record<SupportedLanguage, string> = {
+  'en-IN': 'EN',
+  'hi-IN': 'HI',
+  'te-IN': 'TE',
+}
+
+const normalizeLanguageCode = (code: string | undefined | null): SupportedLanguage | null => {
+  if (!code || code === 'unknown') return null
+  if (code === 'en-US') return 'en-IN'
+  if (code in LANGUAGE_LABELS) return code as SupportedLanguage
+  return null
 }
 
 const backendBaseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
@@ -64,6 +80,7 @@ function App() {
   const [roomName, setRoomName] = useState(defaultRoom)
   const [identity, setIdentity] = useState(defaultIdentity)
   const [voice, setVoice] = useState('default')
+  const [sessionLanguage, setSessionLanguage] = useState<SupportedLanguage>('en-IN')
   // sessionId ties all turns in one conversation to the same backend history.
   // It is replaced with a fresh ID when the user ends the conversation.
   const [sessionId, setSessionId] = useState(generateSessionId)
@@ -175,8 +192,8 @@ function App() {
 
   const extractTranscript = (payload: Record<string, unknown>) => {
     const candidates = [
-      payload.text,
       payload.transcript,
+      payload.text,
       payload.result,
       payload?.data && typeof payload.data === 'object'
         ? (payload.data as Record<string, unknown>).text
@@ -189,6 +206,11 @@ function App() {
     }
 
     return JSON.stringify(payload)
+  }
+
+  const extractDetectedLanguage = (payload: Record<string, unknown>): SupportedLanguage | null => {
+    const code = typeof payload.language_code === 'string' ? payload.language_code : null
+    return normalizeLanguageCode(code)
   }
 
   const ensureRecordingStream = async () => {
@@ -515,7 +537,7 @@ function App() {
     })
   }
 
-  const sendVoiceTurn = async (text: string, city?: string) => {
+  const sendVoiceTurn = async (text: string, city?: string, language?: string) => {
     const response = await fetch(`${backendBaseUrl}/voice/turn`, {
       method: 'POST',
       headers: {
@@ -524,6 +546,7 @@ function App() {
       body: JSON.stringify({
         transcript: text,
         voice,
+        language: language ?? sessionLanguage,
         session_id: sessionId,
         city: city ?? activeCity,
       }),
@@ -533,7 +556,12 @@ function App() {
       throw new Error(await response.text())
     }
 
-    return (await response.json()) as VoiceTurnResponse
+    const payload = (await response.json()) as VoiceTurnResponse
+    const resolvedLanguage = normalizeLanguageCode(payload.language)
+    if (resolvedLanguage) {
+      setSessionLanguage(resolvedLanguage)
+    }
+    return payload
   }
 
   const handleRecordedBlob = async (blob: Blob) => {
@@ -542,7 +570,7 @@ function App() {
     })
     const formData = new FormData()
     formData.append('audio_file', file)
-    formData.append('language', 'en-US')
+    formData.append('language_code', 'unknown')
 
     setIsProcessing(true)
     setStatus('Thinking...')
@@ -558,13 +586,21 @@ function App() {
 
     const transcriptPayload = (await sttResponse.json()) as Record<string, unknown>
     const recognizedText = extractTranscript(transcriptPayload)
+    const detectedLanguage = extractDetectedLanguage(transcriptPayload)
+    if (detectedLanguage) {
+      setSessionLanguage(detectedLanguage)
+    }
     setTranscript(recognizedText)
     appendTurn('user', recognizedText)
 
     const cityForTurn = await syncVoiceToUi(recognizedText)
 
     setStatus('Thinking...')
-    const voiceTurn = await sendVoiceTurn(recognizedText, cityForTurn)
+    const voiceTurn = await sendVoiceTurn(
+      recognizedText,
+      cityForTurn,
+      detectedLanguage ?? 'unknown',
+    )
     setReplyText(voiceTurn.response_text ?? '')
     appendTurn('assistant', voiceTurn.response_text ?? '')
     setIsProcessing(false)
@@ -614,7 +650,7 @@ function App() {
       setIsProcessing(true)
       setStatus('Thinking...')
       const cityForTurn = await syncVoiceToUi(currentQuery)
-      const voiceTurn = await sendVoiceTurn(currentQuery, cityForTurn)
+      const voiceTurn = await sendVoiceTurn(currentQuery, cityForTurn, 'unknown')
       setReplyText(voiceTurn.response_text ?? '')
       appendTurn('assistant', voiceTurn.response_text ?? '')
       setIsProcessing(false)
@@ -683,6 +719,7 @@ function App() {
         const formData = new FormData()
         formData.append('text', 'Hello! I am your AI Real Estate Assistant. How can I help you today?')
         formData.append('voice', voice)
+        formData.append('target_language_code', 'en-IN')
 
         const response = await fetch(`${backendBaseUrl}/soravm/tts`, {
           method: 'POST',
@@ -753,11 +790,11 @@ function App() {
         <section className="ai-assistant-panel">
           <div className="panel-header">
             <h2>AI Assistant</h2>
-            <div className="lang-toggle">
+            <div className="lang-toggle" title={`Speaking: ${LANGUAGE_LABELS[sessionLanguage]}`}>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14">
                 <circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
               </svg>
-              EN
+              {LANGUAGE_LABELS[sessionLanguage]}
             </div>
           </div>
           
