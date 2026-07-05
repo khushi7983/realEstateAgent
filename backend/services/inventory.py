@@ -4,7 +4,7 @@ Priority:  ARK Group projects → static APARTMENTS fallback
 """
 
 from data.apartments import APARTMENTS
-from services.ark_scraper import get_ark_inventory_context, get_ark_projects_for_city
+from services.ark_scraper import get_ark_inventory_context, get_ark_projects, get_ark_projects_for_city
 
 CITY_KEYWORDS: dict[str, str] = {
     # Existing cities
@@ -43,6 +43,31 @@ def detect_city_from_text(text: str) -> str | None:
     return None
 
 
+def get_available_cities() -> list[str]:
+    """Return all cities with known inventory, preserving first-seen order."""
+    seen: set[str] = set()
+    cities: list[str] = []
+
+    for apartment in APARTMENTS:
+        city = apartment.get("city")
+        if city and city not in seen:
+            seen.add(city)
+            cities.append(city)
+
+    for project in get_ark_projects():
+        city = project.get("city")
+        if city and city not in seen:
+            seen.add(city)
+            cities.append(city)
+
+    return cities
+
+
+def format_available_cities(cities: list[str] | None = None) -> str:
+    resolved = cities if cities is not None else get_available_cities()
+    return ", ".join(resolved) if resolved else "no active locations"
+
+
 def get_apartments_for_city(city: str | None) -> list[dict]:
     """Return apartments for a city, ARK projects take priority.
 
@@ -65,6 +90,15 @@ def build_inventory_context(city: str | None) -> str:
 
     Uses ARK Group inventory when available; falls back to static data.
     """
+    available_cities = format_available_cities()
+
+    if not city:
+        return (
+            "No city has been selected yet.\n"
+            f"Available locations: {available_cities}.\n"
+            "If the user does not name a city, ask them to choose one of the available locations instead of assuming Pune."
+        )
+
     # Try ARK first
     ark_context = get_ark_inventory_context(city)
     if ark_context:
@@ -73,7 +107,11 @@ def build_inventory_context(city: str | None) -> str:
     # Static fallback
     listings = get_apartments_for_city(city)
     if not listings:
-        return ""
+        return (
+            f"No listings are available for {city}.\n"
+            f"Available locations: {available_cities}.\n"
+            "Offer one of the available locations instead of inventing inventory for the missing city."
+        )
 
     city_label = city or "all cities"
     lines = [

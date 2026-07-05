@@ -14,7 +14,12 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from services.inventory import build_inventory_context, detect_city_from_text, get_apartments_for_city
+from services.inventory import (
+    build_inventory_context,
+    detect_city_from_text,
+    format_available_cities,
+    get_apartments_for_city,
+)
 from services.language import language_instruction, normalize_language_code, resolve_response_language
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
@@ -158,7 +163,38 @@ def build_real_estate_reply(transcript: str, city: str | None = None) -> str:
         return "I did not catch that. Tell me your budget, preferred area, or number of bedrooms."
 
     resolved_city = city or detect_city_from_text(cleaned_text)
+    available_cities = format_available_cities()
+
+    if not resolved_city and any(
+        keyword in lowered_text
+        for keyword in (
+            "property",
+            "properties",
+            "apartment",
+            "flat",
+            "bhk",
+            "option",
+            "show",
+            "recommend",
+            "looking",
+            "location",
+            "area",
+            "near",
+            "commute",
+        )
+    ):
+        return (
+            f"I can help in these locations: {available_cities}. "
+            "Tell me which city or locality you want, and I will narrow the options."
+        )
+
     listings = get_apartments_for_city(resolved_city)
+
+    if resolved_city and not listings:
+        return (
+            f"I do not have listings in {resolved_city} right now. "
+            f"Available locations are {available_cities}. Which city should I search next?"
+        )
 
     if listings and any(keyword in lowered_text for keyword in ("property", "properties", "apartment", "flat", "bhk", "option", "show", "recommend", "looking")):
         names = ", ".join(

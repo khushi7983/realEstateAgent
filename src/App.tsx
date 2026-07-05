@@ -69,7 +69,7 @@ function App() {
   // speechStartedRef tracks the timestamp when voice first crossed the threshold.
   // A turn is only submitted once ≥800 ms of continuous speech is detected.
   const speechStartedRef = useRef<number | null>(null)
-  const MIN_SPEECH_MS = 800
+  const MIN_SPEECH_MS = 250
 
   // Web Audio playback analysis
   const playbackAnalyserRef = useRef<AnalyserNode | null>(null)
@@ -105,7 +105,7 @@ function App() {
 
   // Inspiration Redesign active states
   const [activeSidebar, setActiveSidebar] = useState('Home')
-  const [activeCity, setActiveCity] = useState('Pune')
+  const [activeCity, setActiveCity] = useState('')
   const [focusedLocationPin, setFocusedLocationPin] = useState('Hinjewadi')
   const [selectedApartment, setSelectedApartment] = useState<Apartment | null>(null)
   const [showPropertyPanel, setShowPropertyPanel] = useState(false)
@@ -548,7 +548,7 @@ function App() {
         voice,
         language: language ?? sessionLanguage,
         session_id: sessionId,
-        city: city ?? activeCity,
+        city: city || activeCity || undefined,
       }),
     })
 
@@ -671,7 +671,7 @@ function App() {
     setIsProcessing(true)
     setStatus('Thinking...')
     try {
-      const voiceTurn = await sendVoiceTurn(query, activeCity)
+      const voiceTurn = await sendVoiceTurn(query, selectedApartment?.city || activeCity || undefined)
       setReplyText(voiceTurn.response_text ?? '')
       appendTurn('assistant', voiceTurn.response_text ?? '')
       setIsProcessing(false)
@@ -694,7 +694,7 @@ function App() {
       setTranscript(query)
       setStatus('Thinking...')
       setIsProcessing(true)
-      sendVoiceTurn(query, activeCity)
+      sendVoiceTurn(query, selectedApartment?.city || activeCity || undefined)
         .then(async (res) => {
           setReplyText(res.response_text ?? '')
           appendTurn('assistant', res.response_text ?? '')

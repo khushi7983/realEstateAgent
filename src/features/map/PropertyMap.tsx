@@ -33,7 +33,7 @@ function LeafletMap({
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return
 
-    const center = CITY_CENTERS[city] ?? CITY_CENTERS.Pune
+    const center = CITY_CENTERS[city] ?? { lat: 20.5937, lng: 78.9629, zoom: 4 }
     const map = L.map(containerRef.current, {
       zoomControl: true,
       scrollWheelZoom: true,

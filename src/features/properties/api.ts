@@ -134,6 +134,10 @@ export async function fetchApartmentsByCity(city: string): Promise<Apartment[]> 
     const data: ApartmentsResponse = await response.json()
     return data.apartments
   } catch {
+    if (!city.trim()) {
+      return FALLBACK_APARTMENTS
+    }
+
     return FALLBACK_APARTMENTS.filter((a) => a.city.toLowerCase() === city.toLowerCase())
   }
 }
