@@ -28,14 +28,16 @@ type VoiceTurnResponse = {
   audio_base64?: string
   audio_mime_type?: string
   language?: string
+  conversation_ended?: boolean
 }
 
-type SupportedLanguage = 'en-IN' | 'hi-IN' | 'te-IN'
+type SupportedLanguage = 'en-IN' | 'hi-IN' | 'te-IN' | 'ta-IN'
 
 const LANGUAGE_LABELS: Record<SupportedLanguage, string> = {
   'en-IN': 'EN',
   'hi-IN': 'HI',
   'te-IN': 'TE',
+  'ta-IN': 'TA',
 }
 
 const normalizeLanguageCode = (code: string | undefined | null): SupportedLanguage | null => {
@@ -90,6 +92,8 @@ function App() {
   const [listening, setListening] = useState(false)
   const [isSpeaking, setIsSpeaking] = useState(false)
   const [isProcessing, setIsProcessing] = useState(false)
+  const [conversationEnded, setConversationEnded] = useState(false)
+  const conversationEndedRef = useRef(false)
   const [showSettings, setShowSettings] = useState(false)
   const [transcript, setTranscript] = useState('')
   const [replyText, setReplyText] = useState('')
@@ -367,7 +371,8 @@ function App() {
         }
       }
 
-      if (listeningRef.current) {
+      // Do NOT restart the recording loop if the conversation has ended
+      if (listeningRef.current && !conversationEndedRef.current) {
         setStatus('Listening...')
         try {
           await startRecordingSegment()
@@ -477,6 +482,79 @@ function App() {
     setStatus('Disconnected')
   }
 
+  // ── Graceful end-of-conversation teardown ────────────────────────────────
+  // Called when the backend signals conversation_ended: true.
+  // Waits for TTS to finish + 2.5 s, then stops everything and updates UI.
+  const GRACEFUL_DELAY_MS = 2500
+
+  const gracefulEndConversation = async () => {
+    console.info('[auto-end] Conversation ended — starting graceful teardown')
+
+    // Mark ended so the recording loop does NOT restart
+    conversationEndedRef.current = true
+    setConversationEnded(true)
+
+    // Wait a beat so the user hears the final TTS in full
+    await new Promise<void>((resolve) => setTimeout(resolve, GRACEFUL_DELAY_MS))
+
+    // 1. Stop recorder and silence monitor
+    if (recorderRef.current?.state === 'recording') {
+      recorderRef.current.stop()
+    }
+    stopSilenceMonitor()
+    recorderRef.current = null
+    chunksRef.current = []
+
+    // 2. Kill the mic stream
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+
+    // 3. Close AudioContext
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => null)
+      audioContextRef.current = null
+      analyserRef.current = null
+      playbackAnalyserRef.current = null
+      audioSourceRef.current = null
+      setMicAnalyser(null)
+      setPlaybackAnalyser(null)
+    }
+
+    // 4. Disconnect LiveKit room
+    const room = roomRef.current
+    if (room) {
+      room.removeAllListeners()
+      await room.disconnect()
+      roomRef.current = null
+    }
+
+    // 5. Clear backend session
+    try {
+      await fetch(`${backendBaseUrl}/session/clear`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId }),
+      })
+    } catch (err) {
+      console.warn('[auto-end] session/clear failed:', err)
+    }
+
+    // 6. Update UI state
+    setListeningState(false)
+    setConnected(false)
+    setIsSpeaking(false)
+    setIsProcessing(false)
+    setStatus('Conversation Ended')
+    appendTurn('system', 'Conversation Ended.')
+
+    // 7. Generate a fresh session ID for the next conversation
+    setSessionId(generateSessionId())
+    hasGreetedRef.current = false
+
+    console.info('[auto-end] Teardown complete')
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
   const base64ToBytes = (audioBase64: string) => {
     const binaryString = atob(audioBase64)
     const bytes = new Uint8Array(binaryString.length)
@@ -563,6 +641,7 @@ function App() {
         transcript: text,
         voice,
         language: language ?? sessionLanguage,
+        preferred_language: sessionLanguage,
         session_id: sessionId,
         city: city || activeCity || undefined,
       }),
@@ -607,9 +686,12 @@ function App() {
     const transcriptPayload = (await sttResponse.json()) as Record<string, unknown>
     const recognizedText = extractTranscript(transcriptPayload)
     const detectedLanguage = extractDetectedLanguage(transcriptPayload)
-    if (detectedLanguage) {
-      setSessionLanguage(detectedLanguage)
-    }
+    // Keep the conversation language controlled by the backend session state.
+    // The STT language is still used as a hint for the current transcript, but
+    // it should not overwrite an explicit language switch chosen by the user.
+    // if (detectedLanguage) {
+    //   setSessionLanguage(detectedLanguage)
+    // }
     setTranscript(recognizedText)
     appendTurn('user', recognizedText)
 
@@ -637,6 +719,14 @@ function App() {
     setIsProcessing(false)
     await playResponseAudio(voiceTurn.audio_base64, voiceTurn.audio_mime_type)
     logLatency('voice_turn_total', turnStartedAt)
+
+    // ── Auto-end: check if backend flagged conversation as complete ──────
+    if (voiceTurn.conversation_ended) {
+      await gracefulEndConversation()
+      return
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     setStatus('Ready')
   }
 
@@ -699,6 +789,14 @@ function App() {
       setIsProcessing(false)
       await playResponseAudio(voiceTurn.audio_base64, voiceTurn.audio_mime_type)
       logLatency('voice_turn_total', turnStartedAt)
+
+      // ── Auto-end: check if backend flagged conversation as complete ────
+      if (voiceTurn.conversation_ended) {
+        await gracefulEndConversation()
+        return
+      }
+      // ───────────────────────────────────────────────────────────────────
+
       setStatus('Ready')
     } catch (error) {
       setIsProcessing(false)
@@ -720,6 +818,12 @@ function App() {
       appendTurn('assistant', voiceTurn.response_text ?? '')
       setIsProcessing(false)
       await playResponseAudio(voiceTurn.audio_base64, voiceTurn.audio_mime_type)
+
+      if (voiceTurn.conversation_ended) {
+        await gracefulEndConversation()
+        return
+      }
+
       setStatus('Ready')
     } catch (error) {
       setIsProcessing(false)
@@ -744,6 +848,12 @@ function App() {
           appendTurn('assistant', res.response_text ?? '')
           setIsProcessing(false)
           await playResponseAudio(res.audio_base64, res.audio_mime_type)
+
+          if (res.conversation_ended) {
+            await gracefulEndConversation()
+            return
+          }
+
           setStatus('Ready')
         })
         .catch((err) => {
@@ -866,7 +976,17 @@ function App() {
               </button>
             </div>
             
-            <button className="btn-primary" onClick={connected ? () => void 0 : connectRoom}>Start Conversation</button>
+            <button
+              className="btn-primary"
+              onClick={connected && !conversationEnded ? () => void 0 : () => {
+                // Reset ended state when starting a fresh conversation
+                conversationEndedRef.current = false
+                setConversationEnded(false)
+                void connectRoom()
+              }}
+            >
+              {conversationEnded ? 'Start New Conversation' : 'Start Conversation'}
+            </button>
             <button className="btn-outline" onClick={disconnectRoom}>End Conversation</button>
           </div>
         </section>

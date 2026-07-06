@@ -24,6 +24,8 @@ from services.inventory import (
     get_apartments_for_city,
 )
 from services.language import language_instruction, normalize_language_code, resolve_response_language
+from services.language import resolve_conversation_language
+from services.conversation_end import should_end_conversation
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -83,6 +85,7 @@ class VoiceTurnRequest(BaseModel):
     transcript: str
     voice: str = "default"
     language: str = "unknown"     # STT-detected BCP-47 code, or "unknown" for text detection
+    preferred_language: str | None = None  # conversation language from the UI/session state
     session_id: str = "default"   # unique per browser session
     city: str | None = None       # active city from UI or detected from speech
 
@@ -93,6 +96,7 @@ class VoiceTurnRequest(BaseModel):
 # the context window never blows up.
 MAX_HISTORY_MESSAGES = 20   # = 10 user turns + 10 assistant turns
 conversation_store: dict[str, list[dict]] = {}
+conversation_language_store: dict[str, str] = {}
 
 
 def require_env(name: str) -> str:
@@ -104,6 +108,16 @@ def require_env(name: str) -> str:
 
 def soravm_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {require_env('SORAVM_API_KEY')}"}
+
+
+def get_session_language(session_id: str) -> str:
+    return conversation_language_store.get(session_id, "en-IN")
+
+
+def set_session_language(session_id: str, language: str | None) -> str:
+    resolved = normalize_language_code(language)
+    conversation_language_store[session_id] = resolved
+    return resolved
 
 
 def transcribe_with_soravm(audio_file: UploadFile, language_code: str = "unknown") -> dict:
@@ -665,7 +679,13 @@ async def voice_turn(turn: VoiceTurnRequest):
     history = conversation_store.setdefault(session_id, [])
 
     resolved_city = turn.city or detect_city_from_text(turn.transcript)
-    resolved_language = resolve_response_language(turn.language, turn.transcript)
+    resolved_language = resolve_conversation_language(
+        current_language=get_session_language(session_id),
+        preferred_language=turn.preferred_language,
+        stt_language=turn.language,
+        transcript=turn.transcript,
+    )
+    set_session_language(session_id, resolved_language)
 
     # ── Active: DeepSeek (with conversation memory) ───────────────────────────
     llm_started_at = time.perf_counter()
@@ -681,6 +701,12 @@ async def voice_turn(turn: VoiceTurnRequest):
     # response_text, reply_source = generate_gemini_reply(turn.transcript)
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ── Conversation-end detection ────────────────────────────────────────────
+    conversation_ended = should_end_conversation(turn.transcript, response_text)
+    if conversation_ended:
+        log.info("conversation_end detected for session=%s", session_id)
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Append this turn to the history and trim to the rolling window
     history.append({"role": "user",      "content": turn.transcript})
     history.append({"role": "assistant", "content": response_text})
@@ -688,6 +714,12 @@ async def voice_turn(turn: VoiceTurnRequest):
         # Drop oldest pairs from the front, keeping the most recent context
         excess = len(history) - MAX_HISTORY_MESSAGES
         del history[:excess]
+
+    # Auto-clear session memory when conversation has ended
+    if conversation_ended:
+        conversation_store.pop(session_id, None)
+        conversation_language_store.pop(session_id, None)
+        log.info("session auto-cleared: %s", session_id)
 
     tts_started_at = time.perf_counter()
     audio_base64, audio_mime_type = await run_in_threadpool(
@@ -707,6 +739,7 @@ async def voice_turn(turn: VoiceTurnRequest):
         "audio_mime_type": audio_mime_type,
         "language": resolved_language,
         "voice": turn.voice,
+        "conversation_ended": conversation_ended,
     }
 
 
@@ -717,5 +750,6 @@ async def session_clear(session_id: str = "default"):
     """
     removed = session_id in conversation_store
     conversation_store.pop(session_id, None)
+    conversation_language_store.pop(session_id, None)
     print(f"Session cleared: {session_id} (existed={removed})")
     return {"cleared": removed, "session_id": session_id}
