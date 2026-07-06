@@ -1,4 +1,5 @@
 import base64
+import logging
 import os
 import time
 import uuid
@@ -10,8 +11,10 @@ import uuid
 import jwt
 import requests
 from dotenv import load_dotenv
+from fastapi.concurrency import run_in_threadpool
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from requests.adapters import HTTPAdapter
 from pydantic import BaseModel
 
 from services.inventory import (
@@ -33,6 +36,11 @@ SORAVM_API_KEY = os.getenv("SORAVM_API_KEY")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL   = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MAX_TOKENS = int(os.getenv("DEEPSEEK_MAX_TOKENS", "120"))
+DEEPSEEK_TEMPERATURE = float(os.getenv("DEEPSEEK_TEMPERATURE", "0.4"))
+DEEPSEEK_HISTORY_TURNS = int(os.getenv("DEEPSEEK_HISTORY_TURNS", "8"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "45"))
+TTS_CODEC = os.getenv("TTS_CODEC", "mp3")
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Gemini env vars (commented out — kept for rollback) ─────────────────────
@@ -54,6 +62,13 @@ from routers.properties import router as properties_router
 
 app = FastAPI(title="RealEstateAgent Voice Pipeline")
 app.include_router(properties_router)
+
+log = logging.getLogger(__name__)
+
+_http_session = requests.Session()
+_http_adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
+_http_session.mount("http://", _http_adapter)
+_http_session.mount("https://", _http_adapter)
 
 app.add_middleware(
     CORSMiddleware,
@@ -92,6 +107,7 @@ def soravm_headers() -> dict[str, str]:
 
 
 def transcribe_with_soravm(audio_file: UploadFile, language_code: str = "unknown") -> dict:
+    started_at = time.perf_counter()
     audio_bytes = audio_file.file.read()
     url = "https://api.sarvam.ai/speech-to-text"
     files = {"file": (audio_file.filename, audio_bytes, audio_file.content_type)}
@@ -101,11 +117,18 @@ def transcribe_with_soravm(audio_file: UploadFile, language_code: str = "unknown
         "language_code": language_code or "unknown",
     }
 
-    response = requests.post(url, headers=soravm_headers(), files=files, data=data, timeout=120)
+    response = _http_session.post(url, headers=soravm_headers(), files=files, data=data, timeout=HTTP_TIMEOUT)
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail=response.text)
 
-    return response.json()
+    payload = response.json()
+    log.info(
+        "latency stage=stt total_ms=%.0f audio_bytes=%d language=%s",
+        (time.perf_counter() - started_at) * 1000,
+        len(audio_bytes),
+        language_code or "unknown",
+    )
+    return payload
 
 
 def resolve_speaker(voice: str) -> str:
@@ -114,8 +137,17 @@ def resolve_speaker(voice: str) -> str:
     return voice
 
 
+def tts_mime_type() -> str:
+    if TTS_CODEC.lower() == "mp3":
+        return "audio/mpeg"
+    if TTS_CODEC.lower() in {"wav", "wave"}:
+        return "audio/wav"
+    return f"audio/{TTS_CODEC.lower()}"
+
+
 def synthesize_sarvam_tts(text: str, target_language_code: str, voice: str = "default") -> tuple[str, str]:
     """Call Sarvam Bulbul v3 TTS. Returns (audio_base64, mime_type)."""
+    started_at = time.perf_counter()
     url = "https://api.sarvam.ai/text-to-speech"
     headers = {**soravm_headers(), "Content-Type": "application/json"}
     payload = {
@@ -123,10 +155,10 @@ def synthesize_sarvam_tts(text: str, target_language_code: str, voice: str = "de
         "target_language_code": normalize_language_code(target_language_code),
         "model": "bulbul:v3",
         "speaker": resolve_speaker(voice),
-        "output_audio_codec": "wav",
+        "output_audio_codec": TTS_CODEC,
     }
 
-    response = requests.post(url, headers=headers, json=payload, timeout=120)
+    response = _http_session.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail=response.text)
 
@@ -135,13 +167,26 @@ def synthesize_sarvam_tts(text: str, target_language_code: str, voice: str = "de
         audios = body.get("audios")
         if not audios or not isinstance(audios, list) or not isinstance(audios[0], str):
             raise HTTPException(status_code=502, detail=f"TTS service returned invalid JSON payload: {body}")
-        return audios[0], "audio/wav"
+        log.info(
+            "latency stage=tts total_ms=%.0f codec=%s language=%s",
+            (time.perf_counter() - started_at) * 1000,
+            TTS_CODEC,
+            target_language_code,
+        )
+        return audios[0], tts_mime_type()
 
     content_type = tts_content_type(response)
     if not content_type.startswith("audio/"):
         raise HTTPException(status_code=502, detail="TTS service returned a non-audio response")
 
     audio_base64 = base64.b64encode(response.content).decode("utf-8")
+    log.info(
+        "latency stage=tts total_ms=%.0f codec=%s language=%s response_bytes=%d",
+        (time.perf_counter() - started_at) * 1000,
+        TTS_CODEC,
+        target_language_code,
+        len(response.content),
+    )
     return audio_base64, content_type
 
 
@@ -155,98 +200,98 @@ def tts_content_type(response: requests.Response) -> str:
     return content_type.split(";", 1)[0].strip() or "audio/wav"
 
 
-def build_real_estate_reply(transcript: str, city: str | None = None) -> str:
-    cleaned_text = transcript.strip()
-    lowered_text = cleaned_text.lower()
+# def build_real_estate_reply(transcript: str, city: str | None = None) -> str:
+#     cleaned_text = transcript.strip()
+#     lowered_text = cleaned_text.lower()
 
-    if not cleaned_text:
-        return "I did not catch that. Tell me your budget, preferred area, or number of bedrooms."
+#     if not cleaned_text:
+#         return "I did not catch that. Tell me your budget, preferred area, or number of bedrooms."
 
-    resolved_city = city or detect_city_from_text(cleaned_text)
-    available_cities = format_available_cities()
+#     resolved_city = city or detect_city_from_text(cleaned_text)
+#     available_cities = format_available_cities()
 
-    if not resolved_city and any(
-        keyword in lowered_text
-        for keyword in (
-            "property",
-            "properties",
-            "apartment",
-            "flat",
-            "bhk",
-            "option",
-            "show",
-            "recommend",
-            "looking",
-            "location",
-            "area",
-            "near",
-            "commute",
-        )
-    ):
-        return (
-            f"I can help in these locations: {available_cities}. "
-            "Tell me which city or locality you want, and I will narrow the options."
-        )
+#     if not resolved_city and any(
+#         keyword in lowered_text
+#         for keyword in (
+#             "property",
+#             "properties",
+#             "apartment",
+#             "flat",
+#             "bhk",
+#             "option",
+#             "show",
+#             "recommend",
+#             "looking",
+#             "location",
+#             "area",
+#             "near",
+#             "commute",
+#         )
+#     ):
+#         return (
+#             f"I can help in these locations: {available_cities}. "
+#             "Tell me which city or locality you want, and I will narrow the options."
+#         )
 
-    listings = get_apartments_for_city(resolved_city)
+#     listings = get_apartments_for_city(resolved_city)
 
-    if resolved_city and not listings:
-        return (
-            f"I do not have listings in {resolved_city} right now. "
-            f"Available locations are {available_cities}. Which city should I search next?"
-        )
+#     if resolved_city and not listings:
+#         return (
+#             f"I do not have listings in {resolved_city} right now. "
+#             f"Available locations are {available_cities}. Which city should I search next?"
+#         )
 
-    if listings and any(keyword in lowered_text for keyword in ("property", "properties", "apartment", "flat", "bhk", "option", "show", "recommend", "looking")):
-        names = ", ".join(
-            f"{item['name']} ({item['bhk']}, {item['price']})" for item in listings
-        )
-        return f"In {resolved_city}, I have these options: {names}. Tell me which one interests you."
+#     if listings and any(keyword in lowered_text for keyword in ("property", "properties", "apartment", "flat", "bhk", "option", "show", "recommend", "looking")):
+#         names = ", ".join(
+#             f"{item['name']} ({item['bhk']}, {item['price']})" for item in listings
+#         )
+#         return f"In {resolved_city}, I have these options: {names}. Tell me which one interests you."
 
-    if listings and resolved_city and any(keyword in lowered_text for keyword in ("delhi", "pune", "mumbai", "hyderabad", "gurugram", "gurgaon")):
-        names = ", ".join(
-            f"{item['name']} ({item['bhk']}, {item['price']})" for item in listings
-        )
-        return f"For {resolved_city}, here are our listings: {names}. Which would you like to explore?"
+#     if listings and resolved_city and any(keyword in lowered_text for keyword in ("delhi", "pune", "mumbai", "hyderabad", "gurugram", "gurgaon")):
+#         names = ", ".join(
+#             f"{item['name']} ({item['bhk']}, {item['price']})" for item in listings
+#         )
+#         return f"For {resolved_city}, here are our listings: {names}. Which would you like to explore?"
 
-    if listings:
-        for item in listings:
-            name_lower = item["name"].lower()
-            if name_lower in lowered_text or any(
-                part in lowered_text for part in name_lower.split() if len(part) > 3
-            ):
-                return (
-                    f"{item['name']} is a great choice — {item['bhk']} starting at {item['price']} "
-                    f"in {item['address']}. {item['description']}"
-                )
+#     if listings:
+#         for item in listings:
+#             name_lower = item["name"].lower()
+#             if name_lower in lowered_text or any(
+#                 part in lowered_text for part in name_lower.split() if len(part) > 3
+#             ):
+#                 return (
+#                     f"{item['name']} is a great choice — {item['bhk']} starting at {item['price']} "
+#                     f"in {item['address']}. {item['description']}"
+#                 )
 
-    if any(keyword in lowered_text for keyword in ("budget", "price", "cost")):
-        return (
-            "I can narrow homes by budget. Share your price band and preferred locality, "
-            "and I will shortlist the most relevant projects."
-        )
+#     if any(keyword in lowered_text for keyword in ("budget", "price", "cost")):
+#         return (
+#             "I can narrow homes by budget. Share your price band and preferred locality, "
+#             "and I will shortlist the most relevant projects."
+#         )
 
-    if any(keyword in lowered_text for keyword in ("visit", "site visit", "book", "schedule")):
-        return (
-            "I can help schedule a site visit. Tell me the project name and your preferred time window, "
-            "and I will prepare the booking details."
-        )
+#     if any(keyword in lowered_text for keyword in ("visit", "site visit", "book", "schedule")):
+#         return (
+#             "I can help schedule a site visit. Tell me the project name and your preferred time window, "
+#             "and I will prepare the booking details."
+#         )
 
-    if any(keyword in lowered_text for keyword in ("location", "area", "near", "commute")):
-        return (
-            "I can search by location, commute, or nearby landmarks. Share the area you want, "
-            "and I will rank the closest matches."
-        )
+#     if any(keyword in lowered_text for keyword in ("location", "area", "near", "commute")):
+#         return (
+#             "I can search by location, commute, or nearby landmarks. Share the area you want, "
+#             "and I will rank the closest matches."
+#         )
 
-    if any(keyword in lowered_text for keyword in ("2 bhk", "3 bhk", "apartment", "villa", "flat")):
-        return (
-            "I can filter inventory by property type and configuration. Tell me the exact home size "
-            "and I will refine the list."
-        )
+#     if any(keyword in lowered_text for keyword in ("2 bhk", "3 bhk", "apartment", "villa", "flat")):
+#         return (
+#             "I can filter inventory by property type and configuration. Tell me the exact home size "
+#             "and I will refine the list."
+#         )
 
-    return (
-        "I can help with budget, location, amenities, and site visits. Tell me what matters most, "
-        "and I will narrow the options."
-    )
+#     return (
+#         "I can help with budget, location, amenities, and site visits. Tell me what matters most, "
+#         "and I will narrow the options."
+#     )
 
 
 # ── Gemini helpers (commented out — kept for rollback) ───────────────────────
@@ -314,8 +359,10 @@ def generate_deepseek_reply(
     Falls back to the local rule-based reply if the API key is missing
     or the call fails.
     """
+    started_at = time.perf_counter()
     resolved_city = city or detect_city_from_text(transcript)
     inventory_block = build_inventory_context(resolved_city)
+    recent_history = history[-DEEPSEEK_HISTORY_TURNS:]
 
     if not DEEPSEEK_API_KEY:
         print("DEEPSEEK_API_KEY not set — using local fallback reply")
@@ -334,7 +381,7 @@ def generate_deepseek_reply(
 
     messages = [
         {"role": "system", "content": system_prompt},
-        *history,                                    # previous turns
+        *recent_history,                              # previous turns
         {"role": "user", "content": transcript},     # current user message
     ]
 
@@ -345,16 +392,16 @@ def generate_deepseek_reply(
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": messages,
-        "max_tokens": 256,
-        "temperature": 0.7,
+        "max_tokens": DEEPSEEK_MAX_TOKENS,
+        "temperature": DEEPSEEK_TEMPERATURE,
     }
 
     try:
-        resp = requests.post(
+        resp = _http_session.post(
             DEEPSEEK_BASE_URL,
             headers=headers,
             json=payload,
-            timeout=30,
+            timeout=HTTP_TIMEOUT,
         )
         if resp.status_code != 200:
             print(f"DeepSeek API error {resp.status_code}: {resp.text}")
@@ -363,7 +410,14 @@ def generate_deepseek_reply(
         data = resp.json()
         reply = data["choices"][0]["message"]["content"].strip()
         model_used = data.get("model", DEEPSEEK_MODEL)
-        print(f"DeepSeek reply generated with {model_used} (history={len(history)} msgs)")
+        log.info(
+            "latency stage=llm total_ms=%.0f model=%s history_used=%d history_total=%d tokens=%d",
+            (time.perf_counter() - started_at) * 1000,
+            model_used,
+            len(recent_history),
+            len(history),
+            DEEPSEEK_MAX_TOKENS,
+        )
         return reply, model_used
 
     except Exception as exc:
@@ -441,7 +495,10 @@ async def soravm_stt(
 ):
     # Accept both `language_code` (Sarvam) and legacy `language` from older clients.
     resolved_code = language_code if language_code else (language or "unknown")
-    return transcribe_with_soravm(audio_file=audio_file, language_code=resolved_code)
+    started_at = time.perf_counter()
+    payload = await run_in_threadpool(transcribe_with_soravm, audio_file, resolved_code)
+    log.info("latency stage=stt_endpoint total_ms=%.0f", (time.perf_counter() - started_at) * 1000)
+    return payload
 
 
 @app.post("/soravm/tts")
@@ -450,12 +507,20 @@ async def soravm_tts(
     voice: str = Form("default"),
     target_language_code: str = Form("en-IN"),
 ):
-    audio_base64, audio_mime_type = synthesize_sarvam_tts(text, target_language_code, voice)
+    started_at = time.perf_counter()
+    audio_base64, audio_mime_type = await run_in_threadpool(
+        synthesize_sarvam_tts,
+        text,
+        target_language_code,
+        voice,
+    )
+    log.info("latency stage=tts_endpoint total_ms=%.0f", (time.perf_counter() - started_at) * 1000)
     return {"audio_base64": audio_base64, "audio_mime_type": audio_mime_type}
 
 
 @app.post("/voice/turn")
 async def voice_turn(turn: VoiceTurnRequest):
+    request_started_at = time.perf_counter()
     # Retrieve or create conversation history for this session
     session_id = turn.session_id or "default"
     history = conversation_store.setdefault(session_id, [])
@@ -464,9 +529,15 @@ async def voice_turn(turn: VoiceTurnRequest):
     resolved_language = resolve_response_language(turn.language, turn.transcript)
 
     # ── Active: DeepSeek (with conversation memory) ───────────────────────────
-    response_text, reply_source = generate_deepseek_reply(
-        turn.transcript, history, resolved_city, resolved_language
+    llm_started_at = time.perf_counter()
+    response_text, reply_source = await run_in_threadpool(
+        generate_deepseek_reply,
+        turn.transcript,
+        history,
+        resolved_city,
+        resolved_language,
     )
+    log.info("latency stage=voice_turn_llm total_ms=%.0f", (time.perf_counter() - llm_started_at) * 1000)
     # ── Rollback: swap the line above with the one below to revert to Gemini ──
     # response_text, reply_source = generate_gemini_reply(turn.transcript)
     # ─────────────────────────────────────────────────────────────────────────
@@ -479,9 +550,15 @@ async def voice_turn(turn: VoiceTurnRequest):
         excess = len(history) - MAX_HISTORY_MESSAGES
         del history[:excess]
 
-    audio_base64, audio_mime_type = synthesize_sarvam_tts(
-        response_text, resolved_language, turn.voice
+    tts_started_at = time.perf_counter()
+    audio_base64, audio_mime_type = await run_in_threadpool(
+        synthesize_sarvam_tts,
+        response_text,
+        resolved_language,
+        turn.voice,
     )
+    log.info("latency stage=voice_turn_tts total_ms=%.0f", (time.perf_counter() - tts_started_at) * 1000)
+    log.info("latency stage=voice_turn_total total_ms=%.0f", (time.perf_counter() - request_started_at) * 1000)
 
     return {
         "transcript": turn.transcript,

@@ -110,6 +110,12 @@ function App() {
   const [selectedApartment, setSelectedApartment] = useState<Apartment | null>(null)
   const [showPropertyPanel, setShowPropertyPanel] = useState(false)
   const [mapZoomMode, setMapZoomMode] = useState<'globe' | 'city' | 'property'>('globe')
+  const turnStartedAtRef = useRef<number | null>(null)
+
+  const logLatency = (label: string, startedAt: number, details?: string) => {
+    const elapsed = Math.round(performance.now() - startedAt)
+    console.info(`[latency] ${label}: ${elapsed}ms${details ? ` ${details}` : ''}`)
+  }
 
   const { apartments, loading: apartmentsLoading } = useApartments(activeCity)
 
@@ -289,7 +295,7 @@ function App() {
           speechDuration >= MIN_SPEECH_MS &&
           silenceTimerRef.current === null
         ) {
-          // Arm a 600ms silence timeout before stopping.
+          // Arm a short silence timeout before stopping so the reply feels snappier.
           // Do NOT clear speechStartedRef here — onstop reads it to decide
           // whether to submit the blob, then resets it itself.
           silenceTimerRef.current = window.setTimeout(() => {
@@ -297,7 +303,7 @@ function App() {
             if (recorderRef.current?.state === 'recording') {
               recorderRef.current.stop()
             }
-          }, 600)
+          }, 300)
         } else if (speechStartedRef.current === null) {
           // No real speech yet — ignore ambient noise entirely
         }
@@ -336,6 +342,10 @@ function App() {
       stopSilenceMonitor()
       recorderRef.current = null
 
+      if (turnStartedAtRef.current !== null) {
+        logLatency('audio_capture', turnStartedAtRef.current)
+      }
+
       const blob = new Blob(chunksRef.current, {
         type: 'audio/webm',
       })
@@ -372,6 +382,8 @@ function App() {
 
     recorderRef.current = recorder
     recorder.start()
+    turnStartedAtRef.current = performance.now()
+    console.info('[latency] audio_capture_start')
     setStatus('Listening...')
     startSilenceMonitor()
   }
@@ -515,12 +527,16 @@ function App() {
 
     setIsSpeaking(true)
 
+    const playbackStartedAt = performance.now()
+
     await audioEl.play()
+    logLatency('audio_playback_start', playbackStartedAt)
 
     await new Promise<void>((resolve, reject) => {
       const handleEnded = () => {
         cleanup()
         setIsSpeaking(false)
+        logLatency('audio_playback_total', playbackStartedAt)
         resolve()
       }
       const handleError = () => {
@@ -565,6 +581,8 @@ function App() {
   }
 
   const handleRecordedBlob = async (blob: Blob) => {
+    const turnStartedAt = performance.now()
+    console.info('[latency] voice_turn_pipeline_start')
     const file = new File([blob], 'turn.webm', {
       type: 'audio/webm',
     })
@@ -574,10 +592,12 @@ function App() {
 
     setIsProcessing(true)
     setStatus('Thinking...')
+    const sttStartedAt = performance.now()
     const sttResponse = await fetch(`${backendBaseUrl}/soravm/stt`, {
       method: 'POST',
       body: formData,
     })
+    logLatency('stt_roundtrip', sttStartedAt)
 
     if (!sttResponse.ok) {
       setIsProcessing(false)
@@ -593,18 +613,30 @@ function App() {
     setTranscript(recognizedText)
     appendTurn('user', recognizedText)
 
-    const cityForTurn = await syncVoiceToUi(recognizedText)
+    const cityForTurn = detectCityFromText(recognizedText) || activeCity || undefined
+    const mapSyncStartedAt = performance.now()
+    const mapSyncPromise = syncVoiceToUi(recognizedText).then((resolvedCity) => {
+      logLatency('property_lookup', mapSyncStartedAt, resolvedCity ? `city=${resolvedCity}` : undefined)
+      return resolvedCity
+    })
 
-    setStatus('Thinking...')
-    const voiceTurn = await sendVoiceTurn(
+    const voiceTurnStartedAt = performance.now()
+    const voiceTurnPromise = sendVoiceTurn(
       recognizedText,
       cityForTurn,
       detectedLanguage ?? 'unknown',
-    )
+    ).then((payload) => {
+      logLatency('backend_voice_turn', voiceTurnStartedAt)
+      return payload
+    })
+
+    setStatus('Thinking...')
+    const [, voiceTurn] = await Promise.all([mapSyncPromise, voiceTurnPromise])
     setReplyText(voiceTurn.response_text ?? '')
     appendTurn('assistant', voiceTurn.response_text ?? '')
     setIsProcessing(false)
     await playResponseAudio(voiceTurn.audio_base64, voiceTurn.audio_mime_type)
+    logLatency('voice_turn_total', turnStartedAt)
     setStatus('Ready')
   }
 
@@ -643,18 +675,30 @@ function App() {
     if (!manualTranscript.trim()) return
 
     try {
+      const turnStartedAt = performance.now()
       const currentQuery = manualTranscript
       setManualTranscript('')
       appendTurn('user', currentQuery)
       setTranscript(currentQuery)
       setIsProcessing(true)
       setStatus('Thinking...')
-      const cityForTurn = await syncVoiceToUi(currentQuery)
-      const voiceTurn = await sendVoiceTurn(currentQuery, cityForTurn, 'unknown')
+      const cityForTurn = detectCityFromText(currentQuery) || activeCity || undefined
+      const mapSyncStartedAt = performance.now()
+      const mapSyncPromise = syncVoiceToUi(currentQuery).then((resolvedCity) => {
+        logLatency('property_lookup', mapSyncStartedAt, resolvedCity ? `city=${resolvedCity}` : undefined)
+        return resolvedCity
+      })
+      const voiceTurnStartedAt = performance.now()
+      const voiceTurnPromise = sendVoiceTurn(currentQuery, cityForTurn, 'unknown').then((payload) => {
+        logLatency('backend_voice_turn', voiceTurnStartedAt)
+        return payload
+      })
+      const [, voiceTurn] = await Promise.all([mapSyncPromise, voiceTurnPromise])
       setReplyText(voiceTurn.response_text ?? '')
       appendTurn('assistant', voiceTurn.response_text ?? '')
       setIsProcessing(false)
       await playResponseAudio(voiceTurn.audio_base64, voiceTurn.audio_mime_type)
+      logLatency('voice_turn_total', turnStartedAt)
       setStatus('Ready')
     } catch (error) {
       setIsProcessing(false)
