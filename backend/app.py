@@ -7,7 +7,8 @@ import uuid
 # ── Gemini (commented out — kept for rollback) ──────────────────────────────
 # import google.generativeai as genai
 # ─────────────────────────────────────────────────────────────────────────────
-
+from routers.properties import router as properties_router
+from services.ark_scraper import get_ark_projects  
 import jwt
 import requests
 from dotenv import load_dotenv
@@ -65,7 +66,26 @@ from routers.properties import router as properties_router
 app = FastAPI(title="RealEstateAgent Voice Pipeline")
 app.include_router(properties_router)
 
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
+
+# ── ARK cache warmup on boot ─────────────────────────────────────────────────
+# Server chalte hi background mein scrape kar lo, taaki client jab bhi link
+# khole, cache already bhara mile — kabhi bhi live-scrape ka wait na karna pade.
+import asyncio
+
+@app.on_event("startup")
+async def warm_ark_cache():
+    async def _scrape():
+        try:
+            log.info("ARK cache warmup: starting...")
+            await run_in_threadpool(get_ark_projects)
+            log.info("ARK cache warmup: done.")
+        except Exception as exc:
+            log.warning(f"ARK cache warmup failed (will retry lazily on first request): {exc}")
+
+    asyncio.create_task(_scrape())
+# ─────────────────────────────────────────────────────────────────────────────
 
 _http_session = requests.Session()
 _http_adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)

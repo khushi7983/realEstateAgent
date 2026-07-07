@@ -376,26 +376,48 @@ def _do_scrape() -> list[dict]:
     log.info("ARK scraper: finished — %d projects loaded", len(projects))
     return projects
 
-
 def get_ark_projects(force: bool = False) -> list[dict]:
-    """Return all ARK Group projects. Uses in-memory cache (TTL = 6 h).
-
-    Parameters
-    ----------
-    force : bool
-        If True, bypass cache and re-scrape immediately.
-    """
     global _cached_projects, _cache_timestamp
 
     with _cache_lock:
         age = time.time() - _cache_timestamp
-        if not force and _cached_projects is not None and age < CACHE_TTL_SECONDS:
+        has_cache = _cached_projects is not None
+
+        # Cache fresh hai → seedha return karo
+        if not force and has_cache and age < CACHE_TTL_SECONDS:
             return _cached_projects
 
+        # Cache stale/missing hai but koi purana data hai → 
+        # WOHI turant return karo, refresh background thread mein karo
+        if has_cache and not force:
+            _trigger_background_refresh()
+            return _cached_projects
+
+        # Sirf pehli hi baar (bilkul koi cache nahi) ya force=True par
+        # hi blocking scrape karo
         projects = _do_scrape()
         _cached_projects = projects
         _cache_timestamp = time.time()
         return projects
+
+
+def _trigger_background_refresh():
+    """Ek hi background refresh chale, duplicate threads na banein."""
+    global _cache_timestamp
+    _cache_timestamp = time.time()  # turant mark kar do taaki dusra request phir se thread na spawn kare
+
+    def _refresh():
+        global _cached_projects, _cache_timestamp
+        try:
+            fresh = _do_scrape()
+            with _cache_lock:
+                _cached_projects = fresh
+                _cache_timestamp = time.time()
+            log.info("ARK background refresh done — %d projects", len(fresh))
+        except Exception as exc:
+            log.warning("ARK background refresh failed, keeping stale data: %s", exc)
+
+    threading.Thread(target=_refresh, daemon=True).start()
 
 
 def get_ark_projects_for_city(city: str | None) -> list[dict]:
