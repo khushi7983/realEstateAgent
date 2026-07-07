@@ -36,5 +36,5 @@ export function fitMapToApartments(map: L.Map, apartments: Apartment[]) {
   const bounds = L.latLngBounds(
     apartments.map((apt) => [apt.latitude, apt.longitude] as [number, number]),
   )
-  map.flyToBounds(bounds, { padding: [56, 56], duration: 1.2, maxZoom: 13 })
+  map.flyToBounds(bounds, { padding: [56, 56], duration: 1.2, maxZoom: 16 })
 }
